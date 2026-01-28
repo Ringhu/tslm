@@ -1,0 +1,20 @@
+# Example SFT config (you can translate into argparse usage)
+llm_name_or_path: Qwen/Qwen3-0.6B-Base
+
+ts:
+  num_vars: 1
+  patch_len: 16
+  d_model: 256
+  layers: 4
+  heads: 8
+
+bridge:
+  prefix_tokens: 32
+
+train:
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  learning_rate: 2.0e-4
+  max_text_length: 512
+  freeze_llm: false
+  use_revin: false
