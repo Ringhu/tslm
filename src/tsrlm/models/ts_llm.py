@@ -134,6 +134,7 @@ class TSReportLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         # Encode TS
         ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)

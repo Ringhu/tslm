@@ -134,6 +134,7 @@ class TSReportLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         # Encode TS
         ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)
@@ -141,6 +142,11 @@ class TSReportLM(nn.Module):
 
         # Token embeddings for text
         tok_embeds = self.llm.get_input_embeddings()(input_ids)  # [B,L,H]
+        
+        # --- 新增：确保类型一致 (float32 -> bfloat16) ---
+        prefix_embeds = prefix_embeds.to(tok_embeds.dtype)
+        # ---------------------------------------------
+        
         inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)  # [B,K+L,H]
         attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
 
