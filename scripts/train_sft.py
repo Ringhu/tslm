@@ -187,7 +187,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        evaluation_strategy="steps" if eval_ds is not None else "no",
+        eval_strategy="steps" if eval_ds is not None else "no",
         eval_steps=args.eval_steps if eval_ds is not None else None,
         save_total_limit=args.save_total_limit,
         fp16=args.fp16,

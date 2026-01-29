@@ -60,7 +60,11 @@ class TSReportLM(nn.Module):
             self.llm.requires_grad_(False)
 
         # most causal LMs use hidden_size
-        llm_dim = int(getattr(self.llm.config, "hidden_size", self.llm.config.hidden_sizes[0]))
+        if hasattr(self.llm.config, "hidden_size"):
+            llm_dim = int(self.llm.config.hidden_size)
+        else:
+            # Fallback for models that might use hidden_sizes (e.g. some encoder-decoders or non-standard archs)
+            llm_dim = int(self.llm.config.hidden_sizes[0])
 
         # --- TS encoder ---
         self.encoder_type = config.encoder_type

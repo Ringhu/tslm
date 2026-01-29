@@ -9,7 +9,7 @@ python -m scripts.train_sft \
   --ts_patch_len 16 --ts_d_model 256 --ts_layers 4 --ts_heads 8 \
   --prefix_tokens 32 --n_stat_tokens 2 \
   --num_train_epochs 3 \
-  --per_device_train_batch_size 32 \
+  --per_device_train_batch_size 16 \
   --learning_rate 2e-4 \
   --bf16 \
   --freeze_llm
