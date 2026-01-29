@@ -8,24 +8,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# 引入所有组件
 from .enc_patchtst import PatchTSTEncoder
 from .enc_chronos2 import Chronos2Encoder
 from .bridge_prefix import PrefixBridge
-from .bridge_xattn import CrossAttentionBridge  # 即使是 NotImplemented 也要引入
+from .bridge_xattn import CrossAttentionBridge
 from .revin import RevIN
 
 
 class TSReportLM(nn.Module):
-    """Time-series -> text model (prefix-bridge baseline)."""
+    """Time-series (supports PatchTST and Chronos-2 encoders) -> text model (prefix-bridge baseline)."""
 
     def __init__(
         self,
         llm_name_or_path: str,
         # 新增/修改参数
-        encoder_type: str = "patchtst",      # patchtst | chronos
+        encoder_type: str = "patchtst",      # patchtst | chronos2
         bridge_type: str = "prefix",         # prefix | xattn
-        chronos_model_path: str = "amazon/chronos-t5-small",
+        chronos_model_path: str = "amazon/chronos-2",
         ts_num_vars: int = 1,
         ts_patch_len: int = 16,
         ts_d_model: int = 256,
@@ -38,7 +37,7 @@ class TSReportLM(nn.Module):
     ) -> None:
         super().__init__()
 
-# 1. Load LLM
+        # 1. Load LLM
         self.tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path, trust_remote_code=trust_remote_code)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -55,7 +54,7 @@ class TSReportLM(nn.Module):
 
         # 2. Select Encoder
         self.encoder_type = encoder_type
-        if encoder_type == "patchtst":
+        if self.encoder_type == "patchtst":
             self.ts_encoder = PatchTSTEncoder(
                 num_vars=ts_num_vars,
                 patch_len=ts_patch_len,
@@ -67,20 +66,17 @@ class TSReportLM(nn.Module):
             # PatchTST 输出维度就是 ts_d_model
             enc_out_dim = ts_d_model
             
-        elif encoder_type == "chronos":
-            # Chronos 输出维度通常由其内部模型决定，这里假设经过 adapter 后或者是 hidden size
-            # 你的 enc_chronos2.py 需要确保输出对齐，或者在这里处理
-            # 简单起见，假设 Chronos2Encoder 也是输出 ts_d_model (或在内部做了投影)
-            # 如果使用原版 Chronos，你可能需要一个 Projector。
-            # 这里我们假设你的 Stub 代码能跑通。
-            self.ts_encoder = Chronos2Encoder(model_name_or_path=chronos_model_path)
-            # ⚠️ 注意：Chronos-t5-small 的 hidden size 是 512，Base 是 768
-            # 为了代码简单，这里暂时假设通过 Bridge 里的 Resampler 处理维度不匹配
-            # 或者你在 enc_chronos2 中修改代码让它输出 ts_d_model
-            enc_out_dim = 512 if "small" in chronos_model_path else 768 # 简单硬编码，实际应动态获取
+        elif self.encoder_type == "chronos2":
+            self.ts_encoder = Chronos2Encoder(
+                model_name_or_path="amazon/chronos-2", # Can be parameterized if needed
+                freeze=True # Usually we freeze the foundation model encoder
+            )
+            # We need to initialize lazy to get dim, or hardcode/infer. 
+            # Accessing output_dim property triggers lazy_init.
+            enc_out_dim = self.ts_encoder.output_dim
+            
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
-
         # 3. Select Bridge
         if bridge_type == "prefix":
             self.bridge = PrefixBridge(
@@ -250,16 +246,44 @@ class TSReportLM(nn.Module):
         prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)
 
         if prompt == "":
-            # some tokenizers cannot handle empty input; use BOS/EOS as a start token
-            prompt = self.tokenizer.bos_token or self.tokenizer.eos_token or ""
-        tok = self.tokenizer(prompt, return_tensors="pt")
+            # Qwen3 tokenizer_config: bos_token is null, eos_token is <|im_end|>
+            # so DO NOT fall back to eos_token here.
+            if self.tokenizer.bos_token_id is not None:
+                input_ids = torch.tensor([[self.tokenizer.bos_token_id]], device=device)
+                attention_mask = torch.ones_like(input_ids)
+                tok_embeds = self.llm.get_input_embeddings()(input_ids)
+            else:
+                tok = self.tokenizer(" ", return_tensors="pt", add_special_tokens=False)
+                input_ids = tok["input_ids"].to(device)
+                attention_mask = tok["attention_mask"].to(device)
+                tok_embeds = self.llm.get_input_embeddings()(input_ids)
+        else:
+            tok = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+            input_ids = tok["input_ids"].to(device)
+            attention_mask = tok["attention_mask"].to(device)
+            tok_embeds = self.llm.get_input_embeddings()(input_ids)
         input_ids = tok["input_ids"].to(device)
         attention_mask = tok["attention_mask"].to(device)
         tok_embeds = self.llm.get_input_embeddings()(input_ids)
+        
+        prefix_embeds = prefix_embeds.to(tok_embeds.dtype)
+        prefix_embeds = 0.03 * prefix_embeds   # 先用 0.03（≈ 1/35）
 
-        inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)
-        attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
+        with torch.no_grad():
+            pe = prefix_embeds
+            print("prefix dtype", pe.dtype)
+            print("prefix nan", torch.isnan(pe).any().item(), "inf", torch.isinf(pe).any().item())
+            print("prefix mean", pe.mean().item(), "std", pe.std().item(),
+                "max", pe.abs().max().item(), "norm", pe.norm(dim=-1).mean().item())
 
+            te = tok_embeds
+            print("tok   mean", te.mean().item(), "std", te.std().item(),
+                "max", te.abs().max().item(), "norm", te.norm(dim=-1).mean().item())
+
+        # inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)
+        # attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
+        inputs_embeds = tok_embeds
+        attn = attention_mask
         gen_ids = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attn,
@@ -271,5 +295,8 @@ class TSReportLM(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
         )
         # remove the prompt part
-        decoded = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        return decoded
+        # decoded = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        # return decoded
+        new_ids = gen_ids[0, input_ids.size(1):]
+        decoded = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+        return decoded.strip()

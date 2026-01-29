@@ -67,7 +67,7 @@ def eval_one(ckpt_dir: Path, eval_jsonl: Path, out_root: Path) -> Path:
         str(Path(__file__).parent / "evaluate.py"),
         "--eval_jsonl",
         str(eval_jsonl),
-        "--ckpt",
+        "--checkpoint_dir",
         str(ckpt_dir),
         "--out_path",
         str(out_path),

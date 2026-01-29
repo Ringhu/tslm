@@ -47,9 +47,9 @@ def parse_args():
     p.add_argument("--freeze_llm", action="store_true")
     p.add_argument("--use_revin", action="store_true")
     # Ablations - Architecture
-    p.add_argument("--encoder_type", type=str, default="patchtst", choices=["patchtst", "chronos"])
+    p.add_argument("--encoder_type", type=str, default="patchtst", choices=["patchtst", "chronos2"])
     p.add_argument("--bridge_type", type=str, default="prefix", choices=["prefix", "xattn"])
-    p.add_argument("--chronos_model_path", type=str, default="amazon/chronos-t5-small")
+    p.add_argument("--chronos_model_path", type=str, default="amazon/chronos-2")
 
     return p.parse_args()
 

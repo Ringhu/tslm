@@ -84,6 +84,8 @@ def load_state(model: TSReportLM, ckpt_dir: Path) -> None:
         
     # Loose loading
     keys = model.load_state_dict(state, strict=False)
+    assert len(keys.missing_keys) < 50, keys.missing_keys[:50]
+    assert len(keys.unexpected_keys) < 50, keys.unexpected_keys[:50]
     print(f"Load keys: missing={len(keys.missing_keys)}, unexpected={len(keys.unexpected_keys)}")
 
 
@@ -141,11 +143,20 @@ def main():
         ref = item["text"]
         hyps.append(hyp)
         refs.append(ref)
+        if len(hyps) < 5:
+            print("ID:", item["id"])
+        print("REF:", ref[:200])
+        print("HYP:", hyp)
+        print("HYP_LEN:", len(hyp))
+        print("="*80)
 
         rouge = scorer.score(ref, hyp)["rougeL"].fmeasure
         rougeL_scores.append(rouge)
 
     # Metrics
+    lengths = [len(h.strip()) for h in hyps]
+    print("empty_ratio", sum(l==0 for l in lengths)/len(lengths))
+    print("avg_len", sum(lengths)/len(lengths))
     bleu = sacrebleu.corpus_bleu(hyps, [refs]).score
     rougeL = float(np.mean(rougeL_scores)) if rougeL_scores else 0.0
 
