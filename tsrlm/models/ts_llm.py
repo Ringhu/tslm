@@ -1,195 +1,137 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from tsrlm.config import TSRLMConfig
 from .enc_patchtst import PatchTSTEncoder
 from .enc_chronos2 import Chronos2Encoder
 from .bridge_prefix import PrefixBridge
 from .bridge_xattn import CrossAttentionBridge
 from .revin import RevIN
+from .stats_tokens import StatsTokenizer
 
 
 class TSReportLM(nn.Module):
-    """Time-series (supports PatchTST and Chronos-2 encoders) -> text model (prefix-bridge baseline)."""
+    """
+    Time series -> tokens (encoder) -> fixed prefix (bridge) -> causal LM.
+
+    This is **not** a HF PreTrainedModel; we use HF Trainer with `remove_unused_columns=False`.
+    """
 
     def __init__(
         self,
-        llm_name_or_path: str,
-        # 新增/修改参数
-        encoder_type: str = "patchtst",      # patchtst | chronos2
-        bridge_type: str = "prefix",         # prefix | xattn
-        chronos_model_path: str = "amazon/chronos-2",
-        ts_num_vars: int = 1,
-        ts_patch_len: int = 16,
-        ts_d_model: int = 256,
-        ts_layers: int = 4,
-        ts_heads: int = 8,
-        prefix_tokens: int = 32,
+        config: TSRLMConfig,
         freeze_llm: bool = False,
-        use_revin: bool = False,
         trust_remote_code: bool = True,
+        torch_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
+        self.config = config
 
-        # 1. Load LLM
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path, trust_remote_code=trust_remote_code)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # --- LLM ---
+        self.tokenizer = AutoTokenizer.from_pretrained(config.llm_name_or_path, trust_remote_code=trust_remote_code)
+        if self.tokenizer.pad_token_id is None:
+            # make padding safe
+            if self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                # last resort
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        # right padding for causal LM
+        self.tokenizer.padding_side = "right"
+
+        if torch_dtype is None:
+            torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
         self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_name_or_path,
+            config.llm_name_or_path,
             trust_remote_code=trust_remote_code,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch_dtype,
         )
-        if freeze_llm:
-            for p in self.llm.parameters():
-                p.requires_grad_(False)
-        llm_dim = self.llm.config.hidden_size
+        # if we added pad token above, resize embeddings
+        if len(self.tokenizer) != self.llm.get_input_embeddings().weight.size(0):
+            self.llm.resize_token_embeddings(len(self.tokenizer))
 
-        # 2. Select Encoder
-        self.encoder_type = encoder_type
+        if freeze_llm:
+            self.llm.requires_grad_(False)
+
+        # most causal LMs use hidden_size
+        llm_dim = int(getattr(self.llm.config, "hidden_size", self.llm.config.hidden_sizes[0]))
+
+        # --- TS encoder ---
+        self.encoder_type = config.encoder_type
         if self.encoder_type == "patchtst":
             self.ts_encoder = PatchTSTEncoder(
-                num_vars=ts_num_vars,
-                patch_len=ts_patch_len,
-                d_model=ts_d_model,
-                nhead=ts_heads,
-                num_layers=ts_layers,
-                use_stat_token=True,
+                num_vars=config.ts_num_vars,
+                patch_len=config.ts_patch_len,
+                d_model=config.ts_d_model,
+                nhead=config.ts_heads,
+                num_layers=config.ts_layers,
             )
-            # PatchTST 输出维度就是 ts_d_model
-            enc_out_dim = ts_d_model
-            
+            enc_out_dim = config.ts_d_model
         elif self.encoder_type == "chronos2":
             self.ts_encoder = Chronos2Encoder(
-                model_name_or_path="amazon/chronos-2", # Can be parameterized if needed
-                freeze=True # Usually we freeze the foundation model encoder
+                model_name_or_path=config.chronos_model_path,
+                freeze=True,
             )
-            # We need to initialize lazy to get dim, or hardcode/infer. 
-            # Accessing output_dim property triggers lazy_init.
             enc_out_dim = self.ts_encoder.output_dim
-            
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}")
-        # 3. Select Bridge
-        if bridge_type == "prefix":
-            self.bridge = PrefixBridge(
-                ts_dim=enc_out_dim,  # 使用 Encoder 的实际输出维度
-                llm_dim=llm_dim,
-                num_prefix_tokens=prefix_tokens
-            )
-        elif bridge_type == "xattn":
-            self.bridge = CrossAttentionBridge(
-                ts_dim=enc_out_dim,
-                llm_dim=llm_dim
-            )
-        else:
-            raise ValueError(f"Unknown bridge_type: {bridge_type}")
+            raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
 
-        # 4. RevIN & Scale Token
-        self.use_revin = use_revin
-        if use_revin:
-            self.revin = RevIN(num_features=ts_num_vars, affine=True)
-
-        # Scale MLP (always init to avoid load_state errors if feasible, or condition it)
-        # 为了兼容性，我们只在 encoder_type='patchtst' 时强依赖这个统计特征
-        # Chronos 自带缩放处理，但为了 Baseline 统一，我们保留这个逻辑
-        stat_dim = 5 * ts_num_vars + 1
-        self.scale_mlp = nn.Sequential(
-            nn.Linear(stat_dim, enc_out_dim), # 映射到 Encoder 输出空间以便 concat
-            nn.GELU(),
-            nn.Linear(enc_out_dim, enc_out_dim),
-            nn.LayerNorm(enc_out_dim),
+        # global stats -> tokens (same dim as encoder output)
+        self.stats_tok = StatsTokenizer(
+            num_vars=config.ts_num_vars,
+            d_model=enc_out_dim,
+            n_tokens=config.n_stat_tokens,
+            dropout=0.0,
         )
 
-    def _masked_stats(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        # same as PatchTSTEncoder._masked_stats but duplicated to avoid tight coupling
-        b, t, d = x.shape
-        if mask is None:
-            m = torch.ones((b, t, 1), device=x.device, dtype=x.dtype)
+        # optional RevIN (applied BEFORE encoder; stats are computed on raw series)
+        self.use_revin = bool(config.use_revin)
+        if self.use_revin:
+            self.revin = RevIN(num_features=config.ts_num_vars, affine=True)
+
+        # --- Bridge ---
+        if config.bridge_type == "prefix":
+            self.bridge = PrefixBridge(
+                ts_dim=enc_out_dim,
+                llm_dim=llm_dim,
+                num_prefix_tokens=config.prefix_tokens,
+                resampler_layers=config.resampler_layers,
+                resampler_heads=config.resampler_heads,
+                prefix_alpha_init=config.prefix_alpha_init,
+            )
+        elif config.bridge_type == "xattn":
+            self.bridge = CrossAttentionBridge(ts_dim=enc_out_dim, llm_dim=llm_dim)
         else:
-            m = mask.unsqueeze(-1).to(x.dtype)
+            raise ValueError(f"Unknown bridge_type: {config.bridge_type}")
 
-        denom = m.sum(dim=1).clamp_min(1.0)
-        mean = (x * m).sum(dim=1) / denom
-        var = ((x - mean.unsqueeze(1)) ** 2 * m).sum(dim=1) / denom
-        std = torch.sqrt(var + 1e-6)
+        # important for training stability
+        self.llm.config.use_cache = False
 
-        x_min = x.clone()
-        x_max = x.clone()
-        if mask is not None:
-            invalid = (~mask).unsqueeze(-1)
-            x_min = x_min.masked_fill(invalid, float("inf"))
-            x_max = x_max.masked_fill(invalid, float("-inf"))
-        vmin = x_min.amin(dim=1)
-        vmax = x_max.amax(dim=1)
+    def encode_ts(self, values: torch.Tensor, ts_attn_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          ts_tokens: [B, N_total, enc_out_dim]
+          ts_mask:   [B, N_total] bool
+        """
+        # stats from raw
+        stat_tokens = self.stats_tok(values, ts_attn_mask)  # [B,S,dim]
+        stat_mask = torch.ones(stat_tokens.size()[:2], device=stat_tokens.device, dtype=torch.bool)
 
-        if mask is None:
-            start = x[:, 0]
-            end = x[:, -1]
-            length = torch.full((b, 1), t, device=x.device, dtype=x.dtype)
-        else:
-            lengths = mask.sum(dim=1).clamp_min(1)
-            start = x[:, 0]
-            end_idx = (lengths - 1).view(b, 1, 1).expand(-1, 1, d)
-            end = x.gather(dim=1, index=end_idx).squeeze(1)
-            length = lengths.to(x.dtype).view(b, 1)
-
-        delta_pct = (end - start) / (start.abs() + 1e-6)
-
-        feats = torch.cat([mean, std, vmin, vmax, delta_pct, length], dim=1)
-        return feats
-
-    def encode_ts(self, values: torch.Tensor, ts_attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         x = values
-        
-        # 1. 提取统计特征用于 Scale Token (无论用什么 Encoder，这都是额外的显式信息)
-        # 注意：这里复用了 PatchTST 的 _masked_stats 逻辑，如果类里没定义需要把那个 helper 函数搬进来
-        # 或者从外部 import。为简洁，假设你已经在类里保留了 _masked_stats
-        stat_vec = self._masked_stats(x, ts_attn_mask)
-        scale_tok = self.scale_mlp(stat_vec).unsqueeze(1) 
-
-        # 2. RevIN Normalize (Optional)
         if self.use_revin:
             x, _, _ = self.revin(x, ts_attn_mask)
 
-        # 3. Encoder Forward
-        # 不同的 Encoder 接口可能略有不同，这里统一为 (x, mask) -> (tokens, mask)
         ts_tokens, ts_mask = self.ts_encoder(x, ts_attn_mask)
-
-        # 4. Prepend Scale Token
-        # 确保 device 和 dtype 一致
-        scale_tok = scale_tok.to(ts_tokens.dtype)
-        ts_tokens = torch.cat([scale_tok, ts_tokens], dim=1)
-        
-        ts_mask_pad = torch.ones((ts_mask.size(0), 1), device=ts_mask.device, dtype=torch.bool)
-        ts_mask = torch.cat([ts_mask_pad, ts_mask], dim=1)
-        
+        # prepend stats tokens
+        ts_tokens = torch.cat([stat_tokens.to(ts_tokens.dtype), ts_tokens], dim=1)
+        ts_mask = torch.cat([stat_mask, ts_mask], dim=1)
         return ts_tokens, ts_mask
-
-    def state_dict(self, *args, **kwargs):
-        # 1. 获取标准的 state_dict
-        state_dict = super().state_dict(*args, **kwargs)
-        
-        # 2. 定义需要检查的共享权重对（根据你的报错信息）
-        # 报错指出的键是 'llm.lm_head.weight' 和 'llm.model.embed_tokens.weight'
-        # 我们通常保留 embed_tokens (作为 source)，移除 lm_head (作为副本)
-        key_to_remove = "llm.lm_head.weight"
-        key_source = "llm.model.embed_tokens.weight"
-
-        # 3. 检查并移除重复引用的权重
-        if key_to_remove in state_dict and key_source in state_dict:
-            # 确认它们确实指向同一个内存对象
-            if state_dict[key_to_remove] is state_dict[key_source]:
-                del state_dict[key_to_remove]
-        
-        return state_dict
 
     def forward(
         self,
@@ -200,23 +142,24 @@ class TSReportLM(nn.Module):
         labels: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        # Encode TS
+        # TS -> prefix
         ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)
-        prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)  # [B,K,H], [B,K]
+        prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)  # [B,K,H]
 
-        # Token embeddings for text
+        # text embeddings
         tok_embeds = self.llm.get_input_embeddings()(input_ids)  # [B,L,H]
-        
-        # --- 新增：确保类型一致 (float32 -> bfloat16) ---
         prefix_embeds = prefix_embeds.to(tok_embeds.dtype)
-        # ---------------------------------------------
-        
+
         inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)  # [B,K+L,H]
         attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
 
         if labels is not None:
-            # pad labels with -100 for prefix positions
-            prefix_labels = torch.full((labels.size(0), prefix_embeds.size(1)), -100, device=labels.device, dtype=labels.dtype)
+            prefix_labels = torch.full(
+                (labels.size(0), prefix_embeds.size(1)),
+                -100,
+                device=labels.device,
+                dtype=labels.dtype,
+            )
             labels = torch.cat([prefix_labels, labels], dim=1)
 
         out = self.llm(
@@ -232,71 +175,92 @@ class TSReportLM(nn.Module):
         self,
         values: torch.Tensor,
         ts_attn_mask: Optional[torch.Tensor],
-        prompt: str = "",
+        prompt: Optional[str] = None,
         max_new_tokens: int = 200,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        repetition_penalty: float = 1.05,
+        no_repeat_ngram_size: int = 3,
+        debug: bool = False,
     ) -> str:
         self.eval()
         device = next(self.parameters()).device
         values = values.to(device)
         ts_attn_mask = ts_attn_mask.to(device) if ts_attn_mask is not None else None
 
+        # TS -> prefix
         ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)
         prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)
 
-        if prompt == "":
-            # Qwen3 tokenizer_config: bos_token is null, eos_token is <|im_end|>
-            # so DO NOT fall back to eos_token here.
-            if self.tokenizer.bos_token_id is not None:
-                input_ids = torch.tensor([[self.tokenizer.bos_token_id]], device=device)
-                attention_mask = torch.ones_like(input_ids)
-                tok_embeds = self.llm.get_input_embeddings()(input_ids)
-            else:
-                tok = self.tokenizer(" ", return_tensors="pt", add_special_tokens=False)
-                input_ids = tok["input_ids"].to(device)
-                attention_mask = tok["attention_mask"].to(device)
-                tok_embeds = self.llm.get_input_embeddings()(input_ids)
-        else:
-            tok = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-            input_ids = tok["input_ids"].to(device)
-            attention_mask = tok["attention_mask"].to(device)
-            tok_embeds = self.llm.get_input_embeddings()(input_ids)
+        if prompt is None or prompt == "":
+            prompt = self.config.default_prompt
+
+        tok = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         input_ids = tok["input_ids"].to(device)
         attention_mask = tok["attention_mask"].to(device)
+
         tok_embeds = self.llm.get_input_embeddings()(input_ids)
-        
         prefix_embeds = prefix_embeds.to(tok_embeds.dtype)
-        prefix_embeds = 0.03 * prefix_embeds   # 先用 0.03（≈ 1/35）
 
-        with torch.no_grad():
-            pe = prefix_embeds
-            print("prefix dtype", pe.dtype)
-            print("prefix nan", torch.isnan(pe).any().item(), "inf", torch.isinf(pe).any().item())
-            print("prefix mean", pe.mean().item(), "std", pe.std().item(),
-                "max", pe.abs().max().item(), "norm", pe.norm(dim=-1).mean().item())
+        inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)
+        attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
 
-            te = tok_embeds
-            print("tok   mean", te.mean().item(), "std", te.std().item(),
-                "max", te.abs().max().item(), "norm", te.norm(dim=-1).mean().item())
+        if debug:
+            # quick sanity stats
+            with torch.no_grad():
+                pe = prefix_embeds.float()
+                te = tok_embeds.float()
+                print("prefix dtype", prefix_embeds.dtype)
+                print("prefix nan", torch.isnan(pe).any().item(), "inf", torch.isinf(pe).any().item())
+                print("prefix mean", pe.mean().item(), "std", pe.std().item(), "max", pe.abs().max().item(), "norm", pe.norm().item())
+                print("tok   mean", te.mean().item(), "std", te.std().item(), "max", te.abs().max().item(), "norm", te.norm().item())
+                print("prefix_alpha", float(self.bridge.prefix_alpha.detach().cpu()))
 
-        # inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)
-        # attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
-        inputs_embeds = tok_embeds
-        attn = attention_mask
-        gen_ids = self.llm.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn,
+        gen_cfg = GenerationConfig(
             max_new_tokens=max_new_tokens,
             do_sample=temperature > 0,
-            temperature=temperature,
+            temperature=max(temperature, 1e-6) if temperature > 0 else 1.0,
             top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        # remove the prompt part
-        # decoded = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        # return decoded
-        new_ids = gen_ids[0, input_ids.size(1):]
-        decoded = self.tokenizer.decode(new_ids, skip_special_tokens=True)
-        return decoded.strip()
+
+        gen_ids = self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn,
+            generation_config=gen_cfg,
+        )
+
+        decoded = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+
+        # best-effort removal of the prompt if it appears verbatim at the beginning
+        if decoded.startswith(prompt):
+            decoded = decoded[len(prompt) :].lstrip()
+        return decoded
+
+    # ---------- saving helpers ----------
+
+    def safe_state_dict(self) -> Dict[str, torch.Tensor]:
+        """
+        safetensors cannot store shared tensors (tied weights).
+        This removes obvious tied duplicates to make saving safe if needed.
+        """
+        sd = super().state_dict()
+        # common tied keys
+        # - lm_head.weight
+        # - model.embed_tokens.weight (or llm.model.embed_tokens.weight in wrapped modules)
+        lm_keys = [k for k in sd.keys() if k.endswith("lm_head.weight")]
+        emb_keys = [k for k in sd.keys() if k.endswith("embed_tokens.weight")]
+        if lm_keys and emb_keys:
+            lm_k = lm_keys[0]
+            emb_k = emb_keys[0]
+            try:
+                if sd[lm_k].data_ptr() == sd[emb_k].data_ptr():
+                    del sd[lm_k]
+            except Exception:
+                pass
+        return sd

@@ -1,57 +1,81 @@
-# tsrlm: Time-Series Report Language Model (SFT + optional DPO)
+# TS-RLM (Rebuild) — Time-Series Captioning via Prefix Conditioning
 
-This repo is a **minimal, engineering-first** skeleton for:
-- reading your generated time-series→text JSONL,
-- encoding time series with a PatchTST-style patch encoder (default),
-- bridging encoder outputs into a Causal LLM via **prefix embeddings** (works with most HF causal LMs),
-- running **SFT** training; and
-- leaving clear interfaces for ablations (RevIN on/off, encoder swap, bridge swap, LLM swap, sliding windows, etc.).
+This repo is a **minimal, end-to-end** baseline to train a model that maps **raw time series** -> **text captions/reports**.
 
-> Note: the cross-attention bridge and Chronos-2 encoder are included as *interfaces / stubs*.
-> The prefix bridge + PatchTST encoder path is complete and intended as your first reproducible baseline.
+Key design choices (compared to your previous version):
+- **SFT format**: each sample has `prompt` + `output`; prompt tokens are **masked** in loss.
+- **Stable generation**: always generate with the same prompt template used in training.
+- **Prefix scale control**: a learnable `prefix_alpha` keeps prefix embeddings in a safe range.
+- **Optional structured output**: `{"facts": ..., "caption": ...}` so you can compute factual metrics.
+- **Data augmentation**: template-based outputs from your `claims` + your original natural captions.
 
-## 1) Install
+## 1) Data format (SFT JSONL)
 
-```bash
-pip install -r requirements.txt
-```
-
-If you want LoRA:
-```bash
-pip install peft
-```
-
-## 2) Data format (expected)
-
-We train from a JSONL file where each line is one sample.
-
-Minimal fields:
+Each line is a JSON object:
 ```json
 {
-  "id": "UCR/XYZ/train/000123",
-  "values": [0.1, 0.2, ...],          // or [[...],[...]] for multivariate
-  "text": "要生成的中文描述…",
-  "stats": {"mean": 0.0, "std": 1.0, "min": -1.2, "max": 2.3, "length": 256},
-  "claims": [ {"type": "global_trend_label", "data": {"label":"down"}}, ... ]
+  "id": "ucr2018:classification:ACSF1/test/000001::json_caption_en",
+  "values": [[...], ...],          // [T,D]
+  "prompt": "You are a time-series captioning assistant... (instruction)",
+  "output": "{\"facts\": {...}, \"caption\": \"...\"}",
+  "meta": {...}                    // optional passthrough
 }
 ```
 
-See: `src/tsrlm/data/format.md`.
+## 2) Build training/eval JSONL from your ts_cap raw JSONL
 
-## 3) Quick start (SFT)
-
+Example (English, mix of styles for training):
 ```bash
-python -m scripts.train_sft   --train_jsonl /path/to/train.jsonl   --eval_jsonl  /path/to/val.jsonl   --llm_name_or_path Qwen/Qwen3-0.6B-Base   --output_dir runs/sft_qwen3_0p6b_patchtst_prefix
+python scripts/build_sft_jsonl.py \
+  --in_jsonl raw_train.jsonl \
+  --out_jsonl data/train_sft.jsonl \
+  --lang en \
+  --styles caption_only json_caption facts_only bullet \
+  --require_claim_pass
 ```
 
-## 4) Project structure
+Example (English, only `json_caption` for evaluation):
+```bash
+python scripts/build_sft_jsonl.py \
+  --in_jsonl raw_test.jsonl \
+  --out_jsonl data/test_json_caption.jsonl \
+  --lang en \
+  --styles json_caption \
+  --require_claim_pass
+```
 
-- `src/tsrlm/data/`: dataset & collator
-- `src/tsrlm/models/`: RevIN, PatchTST encoder, prefix bridge, model wrapper
-- `scripts/`: training & evaluation entrypoints
+## 3) Train
 
-## 5) What you should edit first
+Stage A (recommended first): freeze LLM, train TS encoder + bridge only.
+```bash
+python scripts/train_sft.py \
+  --train_jsonl data/train_sft.jsonl \
+  --eval_jsonl  data/test_json_caption.jsonl \
+  --llm_name_or_path Qwen/Qwen3-0.6B \
+  --output_dir runs/qwen3_0.6b_rebuild \
+  --freeze_llm \
+  --bf16 \
+  --num_train_epochs 3 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-4
+```
 
-- `scripts/prepare_jsonl_adapter.py`: adapt from **your current generator JSON** → the expected JSONL.
-- `configs/*.yaml`: your ablation configs.
+Stage B (optional): unfreeze / LoRA on LLM with a small LR to improve fluency.
+```bash
+python scripts/train_sft.py ... --lora_r 16 --lora_alpha 32 --learning_rate 1e-5
+```
+
+## 4) Evaluate
+
+```bash
+python scripts/evaluate.py \
+  --eval_jsonl data/test_json_caption.jsonl \
+  --checkpoint_dir runs/qwen3_0.6b_rebuild/final_model \
+  --out_dir runs/qwen3_0.6b_rebuild/eval
+```
+
+Outputs:
+- `metrics.json`
+- `predictions.jsonl` (id/ref/hyp + parsed facts)
 

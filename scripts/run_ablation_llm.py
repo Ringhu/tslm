@@ -1,21 +1,3 @@
-"""Run LLM-backbone ablations for TS-RLM.
-
-This is a small convenience wrapper that sequentially calls:
-  1) scripts/train_sft.py
-  2) scripts/evaluate.py
-
-It is intentionally simple (no distributed launching). You can still run a single
-model manually by calling train_sft.py directly.
-
-Example:
-  python scripts/run_ablation_llm.py \
-    --train_jsonl data/schema_v1_train.jsonl \
-    --eval_jsonl  data/schema_v1_test.jsonl \
-    --out_root    runs/ablation_llm \
-    --llms Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B-Base \
-    --extra "--epochs 2 --batch_size 4 --lr 2e-4 --freeze_llm"
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -30,64 +12,13 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def train_one(
-    llm_name_or_path: str,
-    train_jsonl: Path,
-    eval_jsonl: Path,
-    out_root: Path,
-    extra: str,
-) -> Path:
-    out_dir = out_root / llm_name_or_path.replace("/", "__")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable,
-        str(Path(__file__).parent / "train_sft.py"),
-        "--train_jsonl",
-        str(train_jsonl),
-        "--eval_jsonl",
-        str(eval_jsonl),
-        "--llm_name_or_path",
-        llm_name_or_path,
-        "--output_dir",
-        str(out_dir),
-    ]
-
-    if extra.strip():
-        cmd += shlex.split(extra)
-
-    run(cmd)
-    return out_dir
-
-
-def eval_one(ckpt_dir: Path, eval_jsonl: Path, out_root: Path) -> Path:
-    out_path = out_root / f"eval__{ckpt_dir.name}.json"
-    cmd = [
-        sys.executable,
-        str(Path(__file__).parent / "evaluate.py"),
-        "--eval_jsonl",
-        str(eval_jsonl),
-        "--checkpoint_dir",
-        str(ckpt_dir),
-        "--out_path",
-        str(out_path),
-    ]
-    run(cmd)
-    return out_path
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--train_jsonl", type=Path, required=True)
     p.add_argument("--eval_jsonl", type=Path, required=True)
     p.add_argument("--out_root", type=Path, required=True)
-    p.add_argument("--llms", nargs="+", required=True, help="List of HF model ids")
-    p.add_argument(
-        "--extra",
-        type=str,
-        default="",
-        help="Extra args forwarded to scripts/train_sft.py (quoted as one string).",
-    )
+    p.add_argument("--llms", nargs="+", required=True)
+    p.add_argument("--extra", type=str, default="", help="Extra args forwarded to train_sft.py (quoted)")
     p.add_argument("--skip_eval", action="store_true")
     return p.parse_args()
 
@@ -96,16 +27,42 @@ def main() -> None:
     args = parse_args()
     args.out_root.mkdir(parents=True, exist_ok=True)
 
+    train_py = Path(__file__).parent / "train_sft.py"
+    eval_py = Path(__file__).parent / "evaluate.py"
+
     for llm in args.llms:
-        ckpt_dir = train_one(
-            llm_name_or_path=llm,
-            train_jsonl=args.train_jsonl,
-            eval_jsonl=args.eval_jsonl,
-            out_root=args.out_root,
-            extra=args.extra,
-        )
+        out_dir = args.out_root / llm.replace("/", "__")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable,
+            str(train_py),
+            "--train_jsonl",
+            str(args.train_jsonl),
+            "--eval_jsonl",
+            str(args.eval_jsonl),
+            "--llm_name_or_path",
+            llm,
+            "--output_dir",
+            str(out_dir),
+        ]
+        if args.extra.strip():
+            cmd += shlex.split(args.extra)
+        run(cmd)
+
         if not args.skip_eval:
-            eval_one(ckpt_dir=ckpt_dir, eval_jsonl=args.eval_jsonl, out_root=args.out_root)
+            out_eval = out_dir / "eval"
+            cmd2 = [
+                sys.executable,
+                str(eval_py),
+                "--eval_jsonl",
+                str(args.eval_jsonl),
+                "--checkpoint_dir",
+                str(out_dir / "final_model"),
+                "--out_dir",
+                str(out_eval),
+            ]
+            run(cmd2)
 
 
 if __name__ == "__main__":

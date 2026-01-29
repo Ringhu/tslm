@@ -1,2 +1,2 @@
-from .dataset import TSReportDataset
-from .collator import TSDataCollator
+from .dataset import TSSFTDataset
+from .collator import TSSFTCollator

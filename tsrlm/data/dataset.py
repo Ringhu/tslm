@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
 
 JsonDict = Dict[str, Any]
 
@@ -23,22 +21,27 @@ def _as_2d_values(values: Union[List[float], List[List[float]]]) -> np.ndarray:
     return arr
 
 
-class TSReportDataset(Dataset):
-    """Reads SchemaV1 JSONL.
+class TSSFTDataset(Dataset):
+    """
+    SFT JSONL format:
 
-    Each item returns:
+      {
+        "id": "...",
+        "values": [[...], ...],       # [T,D]
+        "prompt": "...",              # instruction / context
+        "output": "...",              # target completion
+        "meta": {...}                 # optional
+      }
+
+    Returns:
       - values: FloatTensor [T, D]
-      - stats: dict (optional)
-      - claims: list (optional)
-      - text: str
+      - prompt: str
+      - output: str
       - id: str
+      - meta: dict (optional)
     """
 
-    def __init__(
-        self,
-        jsonl_path: str,
-        max_samples: Optional[int] = None,
-    ) -> None:
+    def __init__(self, jsonl_path: str, max_samples: Optional[int] = None) -> None:
         self.path = Path(jsonl_path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
@@ -53,10 +56,11 @@ class TSReportDataset(Dataset):
                 if max_samples is not None and len(self.rows) >= max_samples:
                     break
 
-        # basic validation
-        for i, r in enumerate(self.rows[:50]):  # cheap sanity check
-            if "id" not in r or "values" not in r or "text" not in r:
-                raise ValueError(f"Row {i} missing required fields: {r.keys()}")
+        # cheap sanity check
+        for i, r in enumerate(self.rows[:50]):
+            for k in ("id", "values", "prompt", "output"):
+                if k not in r:
+                    raise ValueError(f"Row {i} missing required field '{k}': got keys={list(r.keys())}")
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -66,15 +70,12 @@ class TSReportDataset(Dataset):
         values = _as_2d_values(r["values"])
         item: JsonDict = {
             "id": r["id"],
-            "values": torch.from_numpy(values),  # [T, D]
-            "text": r["text"],
+            "values": torch.from_numpy(values),  # [T,D]
+            "prompt": r["prompt"],
+            "output": r["output"],
         }
-        if "stats" in r:
-            item["stats"] = r["stats"]
-        if "claims" in r:
-            item["claims"] = r["claims"]
         if "meta" in r:
             item["meta"] = r["meta"]
-        if "segments" in r:
-            item["segments"] = r["segments"]
+        if "facts" in r:
+            item["facts"] = r["facts"]
         return item

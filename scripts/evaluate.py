@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -11,171 +11,329 @@ from tqdm import tqdm
 from rouge_score import rouge_scorer
 import sacrebleu
 
-from tsrlm.data.dataset import TSReportDataset
-from tsrlm.models.ts_llm import TSReportLM
+from tsrlm.config import TSRLMConfig
+from tsrlm.data import TSSFTDataset
+from tsrlm.models import TSReportLM
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--eval_jsonl", type=str, required=True)
     p.add_argument("--checkpoint_dir", type=str, required=True)
-    p.add_argument("--llm_name_or_path", type=str, required=True)
-    p.add_argument("--out_path", type=str, default=None, help="Path to save metrics JSON")
+    p.add_argument("--out_dir", type=str, required=True)
 
-    # Architecture Args (Must match train_sft.py)
-    p.add_argument("--ts_num_vars", type=int, default=1)
-    p.add_argument("--ts_patch_len", type=int, default=16)
-    p.add_argument("--ts_d_model", type=int, default=256)
-    p.add_argument("--ts_layers", type=int, default=4)
-    p.add_argument("--ts_heads", type=int, default=8)
-    
-    # Ablation Args
-    p.add_argument("--encoder_type", type=str, default="patchtst", choices=["patchtst", "chronos"])
-    p.add_argument("--bridge_type", type=str, default="prefix", choices=["prefix", "xattn"])
-    p.add_argument("--chronos_model_path", type=str, default="amazon/chronos-t5-small")
-    p.add_argument("--prefix_tokens", type=int, default=32)
-
-    # Generation Args
-    p.add_argument("--max_new_tokens", type=int, default=200)
+    # generation
+    p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top_p", type=float, default=0.9)
-    p.add_argument("--prompt", type=str, default="")
+    p.add_argument("--top_k", type=int, default=0)
+    p.add_argument("--repetition_penalty", type=float, default=1.05)
+    p.add_argument("--no_repeat_ngram_size", type=int, default=3)
+
     p.add_argument("--limit", type=int, default=None)
-    
-    # Ignore unknown args (like --learning_rate passed by shell script "$@")
-    args, unknown = p.parse_known_args()
-    return args
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--trust_remote_code", action="store_true")
+
+    return p.parse_args()
+
+
+def maybe_apply_lora_from_ckpt(model: TSReportLM, ckpt_dir: Path) -> None:
+    lora_path = ckpt_dir / "lora_config.json"
+    if not lora_path.exists():
+        return
+    try:
+        from peft import LoraConfig, get_peft_model, TaskType
+    except Exception as e:
+        raise ImportError("peft is required to load LoRA checkpoint. Install: pip install peft") from e
+
+    cfg = json.loads(lora_path.read_text(encoding="utf-8"))
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=int(cfg["r"]),
+        lora_alpha=int(cfg["alpha"]),
+        lora_dropout=float(cfg["dropout"]),
+        target_modules=list(cfg["target_modules"]),
+        bias="none",
+    )
+    model.llm = get_peft_model(model.llm, lora_cfg)
 
 
 def load_state(model: TSReportLM, ckpt_dir: Path) -> None:
-    # try typical HF filename
     candidates = [
         ckpt_dir / "pytorch_model.bin",
         ckpt_dir / "model.safetensors",
-        ckpt_dir / "adapter_model.bin", # LoRA case
     ]
     found = None
     for c in candidates:
         if c.exists():
             found = c
             break
-            
-    # Trainer sometimes nests checks
     if found is None:
-        # Search recursively
         files = list(ckpt_dir.rglob("pytorch_model.bin")) + list(ckpt_dir.rglob("model.safetensors"))
         if files:
             found = files[0]
-
     if found is None:
         raise FileNotFoundError(f"No checkpoint found under {ckpt_dir}")
-    
+
     print(f"Loading weights from: {found}")
-    
-    # Handle safetensors
     if str(found).endswith(".safetensors"):
         from safetensors.torch import load_file
+
         state = load_file(found)
     else:
         state = torch.load(found, map_location="cpu")
-        
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-        
-    # Loose loading
+
     keys = model.load_state_dict(state, strict=False)
-    assert len(keys.missing_keys) < 50, keys.missing_keys[:50]
-    assert len(keys.unexpected_keys) < 50, keys.unexpected_keys[:50]
     print(f"Load keys: missing={len(keys.missing_keys)}, unexpected={len(keys.unexpected_keys)}")
+
+
+def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return None
+    # best-effort: find a JSON object substring
+    l = text.find("{")
+    r = text.rfind("}")
+    if l == -1 or r == -1 or r <= l:
+        return None
+    sub = text[l : r + 1]
+    try:
+        return json.loads(sub)
+    except Exception:
+        return None
+
+
+def extract_caption(text: str) -> str:
+    obj = try_parse_json(text)
+    if isinstance(obj, dict) and "caption" in obj and isinstance(obj["caption"], str):
+        return obj["caption"].strip()
+    return text.strip()
+
+
+def extract_facts(text: str) -> Optional[Dict[str, Any]]:
+    obj = try_parse_json(text)
+    if isinstance(obj, dict) and "facts" in obj and isinstance(obj["facts"], dict):
+        return obj["facts"]
+    return None
+
+
+def factual_metrics(gt: Optional[Dict[str, Any]], pred: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Simple factual metrics (compute what we can robustly).
+
+    - exact match for categorical keys: trend, volatility, seasonality.has
+    - MAE for numeric keys: delta_pct, seasonality.period
+    - MAE for peak/valley idx/value if present
+    """
+    out: Dict[str, float] = {}
+    if gt is None or pred is None:
+        return out
+
+    def _eq(k: str) -> Optional[float]:
+        if k in gt and k in pred:
+            return float(gt[k] == pred[k])
+        return None
+
+    def _mae(a: Any, b: Any) -> Optional[float]:
+        try:
+            return float(abs(float(a) - float(b)))
+        except Exception:
+            return None
+
+    # categorical
+    for k in ["trend", "volatility", "net_change_sign"]:
+        v = _eq(k)
+        if v is not None:
+            out[f"fact_acc/{k}"] = v
+
+    # delta pct
+    if "delta_pct" in gt and "delta_pct" in pred:
+        v = _mae(gt["delta_pct"], pred["delta_pct"])
+        if v is not None:
+            out["fact_mae/delta_pct"] = v
+
+    # nested seasonality fields
+    if isinstance(gt.get("seasonality"), dict) and isinstance(pred.get("seasonality"), dict):
+        g = gt["seasonality"]
+        p = pred["seasonality"]
+        if "has" in g and "has" in p:
+            out["fact_acc/seasonality_has"] = float(bool(g["has"]) == bool(p["has"]))
+        if "period" in g and "period" in p:
+            v = _mae(g["period"], p["period"])
+            if v is not None:
+                out["fact_mae/seasonality_period"] = v
+
+    # peak/valley
+    def _idx_value(prefix: str, key: str) -> None:
+        if not isinstance(gt.get(key), dict) or not isinstance(pred.get(key), dict):
+            return
+        g = gt[key]
+        p = pred[key]
+        if "idx" in g and "idx" in p:
+            v = _mae(g["idx"], p["idx"])
+            if v is not None:
+                out[f"fact_mae/{key}_idx"] = v
+        if "value" in g and "value" in p:
+            v = _mae(g["value"], p["value"])
+            if v is not None:
+                out[f"fact_mae/{key}_value"] = v
+
+    _idx_value("peak", "peak")
+    _idx_value("valley", "valley")
+
+    return out
+
+
+    def _eq(k: str) -> Optional[float]:
+        if k in gt and k in pred:
+            return float(gt[k] == pred[k])
+        return None
+
+    def _mae(k: str) -> Optional[float]:
+        if k in gt and k in pred:
+            try:
+                return float(abs(float(gt[k]) - float(pred[k])))
+            except Exception:
+                return None
+        return None
+
+    for k in ["trend", "volatility"]:
+        v = _eq(k)
+        if v is not None:
+            out[f"fact_acc/{k}"] = v
+
+    # nested seasonality fields
+    if isinstance(gt.get("seasonality"), dict) and isinstance(pred.get("seasonality"), dict):
+        g = gt["seasonality"]
+        p = pred["seasonality"]
+        if "has" in g and "has" in p:
+            out["fact_acc/seasonality_has"] = float(bool(g["has"]) == bool(p["has"]))
+        if "period" in g and "period" in p:
+            try:
+                out["fact_mae/seasonality_period"] = float(abs(float(g["period"]) - float(p["period"])))
+            except Exception:
+                pass
+
+    v = _mae("delta_pct")
+    if v is not None:
+        out["fact_mae/delta_pct"] = v
+
+    return out
 
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt_dir = Path(args.checkpoint_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize model with correct architecture
+    # load config saved by training
+    cfg_path = ckpt_dir / "tsrlm_config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing tsrlm_config.json in {ckpt_dir}")
+    cfg = TSRLMConfig.load(cfg_path)
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # dtype for eval
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
     model = TSReportLM(
-        llm_name_or_path=args.llm_name_or_path,
-        encoder_type=args.encoder_type,
-        bridge_type=args.bridge_type,
-        chronos_model_path=args.chronos_model_path,
-        ts_num_vars=args.ts_num_vars,
-        ts_patch_len=args.ts_patch_len,
-        ts_d_model=args.ts_d_model,
-        ts_layers=args.ts_layers,
-        ts_heads=args.ts_heads,
-        prefix_tokens=args.prefix_tokens,
-        freeze_llm=False, # Eval doesn't care
-        use_revin=False,  # Weights already loaded, RevIN layer exists but state dict covers it
-        trust_remote_code=True,
+        config=cfg,
+        freeze_llm=False,
+        trust_remote_code=args.trust_remote_code,
+        torch_dtype=torch_dtype,
     ).to(device)
 
-    load_state(model, Path(args.checkpoint_dir))
+    # if LoRA checkpoint, apply before loading weights
+    maybe_apply_lora_from_ckpt(model, ckpt_dir)
+    load_state(model, ckpt_dir)
     model.eval()
 
-    ds = TSReportDataset(args.eval_jsonl, max_samples=args.limit)
+    ds = TSSFTDataset(args.eval_jsonl, max_samples=args.limit)
 
+    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
+    rougeL_scores: List[float] = []
     refs: List[str] = []
     hyps: List[str] = []
 
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
-    rougeL_scores = []
+    # factual aggregates
+    fact_acc: Dict[str, List[float]] = {}
+
+    pred_path = out_dir / "predictions.jsonl"
+    wf = pred_path.open("w", encoding="utf-8")
 
     print(f"Generating for {len(ds)} samples...")
     for item in tqdm(ds, desc="Inference"):
         values = item["values"].unsqueeze(0).to(device)  # [1,T,D]
-        # Make a mask (all valid)
         mask = torch.ones((1, values.size(1)), dtype=torch.bool, device=device)
-        
-        try:
+
+        prompt = item.get("prompt") or cfg.default_prompt
+        with torch.no_grad():
             hyp = model.generate(
                 values=values,
                 ts_attn_mask=mask,
-                prompt=args.prompt,
+                prompt=prompt,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
+                top_k=args.top_k,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                debug=False,
             )
-        except Exception as e:
-            print(f"Error generating sample {item['id']}: {e}")
-            hyp = ""
 
-        ref = item["text"]
-        hyps.append(hyp)
-        refs.append(ref)
-        if len(hyps) < 5:
-            print("ID:", item["id"])
-        print("REF:", ref[:200])
-        print("HYP:", hyp)
-        print("HYP_LEN:", len(hyp))
-        print("="*80)
+        ref = item["output"]
+        hyp_cap = extract_caption(hyp)
+        ref_cap = extract_caption(ref)
 
-        rouge = scorer.score(ref, hyp)["rougeL"].fmeasure
-        rougeL_scores.append(rouge)
+        hyps.append(hyp_cap)
+        refs.append(ref_cap)
+        rougeL_scores.append(scorer.score(ref_cap, hyp_cap)["rougeL"].fmeasure)
 
-    # Metrics
-    lengths = [len(h.strip()) for h in hyps]
-    print("empty_ratio", sum(l==0 for l in lengths)/len(lengths))
-    print("avg_len", sum(lengths)/len(lengths))
-    bleu = sacrebleu.corpus_bleu(hyps, [refs]).score
+        # factual
+        gt_facts = item.get("facts") or extract_facts(ref)
+        pred_facts = extract_facts(hyp)
+        fm = factual_metrics(gt_facts, pred_facts)
+        for k, v in fm.items():
+            fact_acc.setdefault(k, []).append(v)
+
+        wf.write(
+            json.dumps(
+                {
+                    "id": item["id"],
+                    "prompt": prompt,
+                    "ref": ref,
+                    "hyp": hyp,
+                    "ref_caption": ref_cap,
+                    "hyp_caption": hyp_cap,
+                    "gt_facts": gt_facts,
+                    "pred_facts": pred_facts,
+                    "factual": fm,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+    wf.close()
+
+    bleu = sacrebleu.corpus_bleu(hyps, [refs]).score if hyps else 0.0
     rougeL = float(np.mean(rougeL_scores)) if rougeL_scores else 0.0
 
-    out = {
+    metrics: Dict[str, Any] = {
+        "n": len(ds),
         "bleu": bleu,
         "rougeL": rougeL,
-        "n": len(ds),
-        "args": vars(args)
     }
-    
-    # Save or Print
-    if args.out_path:
-        out_p = Path(args.out_path)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_p, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        print(f"Results saved to {args.out_path}")
-    else:
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    for k, vals in fact_acc.items():
+        metrics[k] = float(np.mean(vals)) if vals else 0.0
+
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("Saved:")
+    print(" -", pred_path)
+    print(" -", out_dir / "metrics.json")
+
 
 if __name__ == "__main__":
     main()
