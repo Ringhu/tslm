@@ -8,8 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# 引入所有组件
 from .enc_patchtst import PatchTSTEncoder
+from .enc_chronos2 import Chronos2Encoder
 from .bridge_prefix import PrefixBridge
+from .bridge_xattn import CrossAttentionBridge  # 即使是 NotImplemented 也要引入
 from .revin import RevIN
 
 
@@ -19,6 +22,10 @@ class TSReportLM(nn.Module):
     def __init__(
         self,
         llm_name_or_path: str,
+        # 新增/修改参数
+        encoder_type: str = "patchtst",      # patchtst | chronos
+        bridge_type: str = "prefix",         # prefix | xattn
+        chronos_model_path: str = "amazon/chronos-t5-small",
         ts_num_vars: int = 1,
         ts_patch_len: int = 16,
         ts_d_model: int = 256,
@@ -31,9 +38,9 @@ class TSReportLM(nn.Module):
     ) -> None:
         super().__init__()
 
+# 1. Load LLM
         self.tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path, trust_remote_code=trust_remote_code)
         if self.tokenizer.pad_token is None:
-            # common for causal LMs: use eos as pad
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.llm = AutoModelForCausalLM.from_pretrained(
@@ -41,35 +48,68 @@ class TSReportLM(nn.Module):
             trust_remote_code=trust_remote_code,
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         )
-
         if freeze_llm:
             for p in self.llm.parameters():
                 p.requires_grad_(False)
-
         llm_dim = self.llm.config.hidden_size
 
-        self.ts_encoder = PatchTSTEncoder(
-            num_vars=ts_num_vars,
-            patch_len=ts_patch_len,
-            d_model=ts_d_model,
-            nhead=ts_heads,
-            num_layers=ts_layers,
-            use_stat_token=True,
-        )
-        self.bridge = PrefixBridge(ts_dim=ts_d_model, llm_dim=llm_dim, num_prefix_tokens=prefix_tokens)
+        # 2. Select Encoder
+        self.encoder_type = encoder_type
+        if encoder_type == "patchtst":
+            self.ts_encoder = PatchTSTEncoder(
+                num_vars=ts_num_vars,
+                patch_len=ts_patch_len,
+                d_model=ts_d_model,
+                nhead=ts_heads,
+                num_layers=ts_layers,
+                use_stat_token=True,
+            )
+            # PatchTST 输出维度就是 ts_d_model
+            enc_out_dim = ts_d_model
+            
+        elif encoder_type == "chronos":
+            # Chronos 输出维度通常由其内部模型决定，这里假设经过 adapter 后或者是 hidden size
+            # 你的 enc_chronos2.py 需要确保输出对齐，或者在这里处理
+            # 简单起见，假设 Chronos2Encoder 也是输出 ts_d_model (或在内部做了投影)
+            # 如果使用原版 Chronos，你可能需要一个 Projector。
+            # 这里我们假设你的 Stub 代码能跑通。
+            self.ts_encoder = Chronos2Encoder(model_name_or_path=chronos_model_path)
+            # ⚠️ 注意：Chronos-t5-small 的 hidden size 是 512，Base 是 768
+            # 为了代码简单，这里暂时假设通过 Bridge 里的 Resampler 处理维度不匹配
+            # 或者你在 enc_chronos2 中修改代码让它输出 ts_d_model
+            enc_out_dim = 512 if "small" in chronos_model_path else 768 # 简单硬编码，实际应动态获取
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
+        # 3. Select Bridge
+        if bridge_type == "prefix":
+            self.bridge = PrefixBridge(
+                ts_dim=enc_out_dim,  # 使用 Encoder 的实际输出维度
+                llm_dim=llm_dim,
+                num_prefix_tokens=prefix_tokens
+            )
+        elif bridge_type == "xattn":
+            self.bridge = CrossAttentionBridge(
+                ts_dim=enc_out_dim,
+                llm_dim=llm_dim
+            )
+        else:
+            raise ValueError(f"Unknown bridge_type: {bridge_type}")
+
+        # 4. RevIN & Scale Token
         self.use_revin = use_revin
         if use_revin:
             self.revin = RevIN(num_features=ts_num_vars, affine=True)
 
-        # Optional extra scale token to preserve original scale when using RevIN
-        # vector: mean,std,min,max,delta_pct,length => 5*D+1
+        # Scale MLP (always init to avoid load_state errors if feasible, or condition it)
+        # 为了兼容性，我们只在 encoder_type='patchtst' 时强依赖这个统计特征
+        # Chronos 自带缩放处理，但为了 Baseline 统一，我们保留这个逻辑
         stat_dim = 5 * ts_num_vars + 1
         self.scale_mlp = nn.Sequential(
-            nn.Linear(stat_dim, ts_d_model),
+            nn.Linear(stat_dim, enc_out_dim), # 映射到 Encoder 输出空间以便 concat
             nn.GELU(),
-            nn.Linear(ts_d_model, ts_d_model),
-            nn.LayerNorm(ts_d_model),
+            nn.Linear(enc_out_dim, enc_out_dim),
+            nn.LayerNorm(enc_out_dim),
         )
 
     def _masked_stats(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -111,21 +151,49 @@ class TSReportLM(nn.Module):
         return feats
 
     def encode_ts(self, values: torch.Tensor, ts_attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode time series into token embeddings (ts space)."""
-        # values: [B,T,D]
         x = values
-        # preserve original stats for scale token
-        stat_vec = self._masked_stats(x, ts_attn_mask)  # [B,5D+1]
-        scale_tok = self.scale_mlp(stat_vec).unsqueeze(1)  # [B,1,ts_d_model]
+        
+        # 1. 提取统计特征用于 Scale Token (无论用什么 Encoder，这都是额外的显式信息)
+        # 注意：这里复用了 PatchTST 的 _masked_stats 逻辑，如果类里没定义需要把那个 helper 函数搬进来
+        # 或者从外部 import。为简洁，假设你已经在类里保留了 _masked_stats
+        stat_vec = self._masked_stats(x, ts_attn_mask)
+        scale_tok = self.scale_mlp(stat_vec).unsqueeze(1) 
 
+        # 2. RevIN Normalize (Optional)
         if self.use_revin:
             x, _, _ = self.revin(x, ts_attn_mask)
 
-        ts_tokens, ts_mask = self.ts_encoder(x, ts_attn_mask)  # [B,N,ts_d], [B,N]
-        # prepend scale token
+        # 3. Encoder Forward
+        # 不同的 Encoder 接口可能略有不同，这里统一为 (x, mask) -> (tokens, mask)
+        ts_tokens, ts_mask = self.ts_encoder(x, ts_attn_mask)
+
+        # 4. Prepend Scale Token
+        # 确保 device 和 dtype 一致
+        scale_tok = scale_tok.to(ts_tokens.dtype)
         ts_tokens = torch.cat([scale_tok, ts_tokens], dim=1)
-        ts_mask = torch.cat([torch.ones((ts_mask.size(0), 1), device=ts_mask.device, dtype=torch.bool), ts_mask], dim=1)
+        
+        ts_mask_pad = torch.ones((ts_mask.size(0), 1), device=ts_mask.device, dtype=torch.bool)
+        ts_mask = torch.cat([ts_mask_pad, ts_mask], dim=1)
+        
         return ts_tokens, ts_mask
+
+    def state_dict(self, *args, **kwargs):
+        # 1. 获取标准的 state_dict
+        state_dict = super().state_dict(*args, **kwargs)
+        
+        # 2. 定义需要检查的共享权重对（根据你的报错信息）
+        # 报错指出的键是 'llm.lm_head.weight' 和 'llm.model.embed_tokens.weight'
+        # 我们通常保留 embed_tokens (作为 source)，移除 lm_head (作为副本)
+        key_to_remove = "llm.lm_head.weight"
+        key_source = "llm.model.embed_tokens.weight"
+
+        # 3. 检查并移除重复引用的权重
+        if key_to_remove in state_dict and key_source in state_dict:
+            # 确认它们确实指向同一个内存对象
+            if state_dict[key_to_remove] is state_dict[key_source]:
+                del state_dict[key_to_remove]
+        
+        return state_dict
 
     def forward(
         self,

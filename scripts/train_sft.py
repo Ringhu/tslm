@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
 
 import torch
 from transformers import Trainer, TrainingArguments
@@ -45,6 +46,10 @@ def parse_args():
     # Ablations
     p.add_argument("--freeze_llm", action="store_true")
     p.add_argument("--use_revin", action="store_true")
+    # Ablations - Architecture
+    p.add_argument("--encoder_type", type=str, default="patchtst", choices=["patchtst", "chronos"])
+    p.add_argument("--bridge_type", type=str, default="prefix", choices=["prefix", "xattn"])
+    p.add_argument("--chronos_model_path", type=str, default="amazon/chronos-t5-small")
 
     return p.parse_args()
 
@@ -56,6 +61,9 @@ def main():
 
     model = TSReportLM(
         llm_name_or_path=args.llm_name_or_path,
+        encoder_type=args.encoder_type,          # NEW
+        bridge_type=args.bridge_type,            # NEW
+        chronos_model_path=args.chronos_model_path, # NEW
         ts_num_vars=args.ts_num_vars,
         ts_patch_len=args.ts_patch_len,
         ts_d_model=args.ts_d_model,
@@ -88,6 +96,7 @@ def main():
         fp16=args.fp16,
         bf16=args.bf16,
         remove_unused_columns=False,  # important: we pass custom tensors
+        save_safetensors=False,
         report_to=[],
     )
 

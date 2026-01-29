@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=2
 python -m scripts.train_sft \
   --train_jsonl /cluster/home/user1/hulining/TSDataset/LTSGen/tslm/data/train_schema_v1.jsonl \
   --eval_jsonl  /cluster/home/user1/hulining/TSDataset/LTSGen/tslm/data/test_schema_v1.jsonl \
