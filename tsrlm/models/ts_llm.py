@@ -179,7 +179,7 @@ class TSReportLM(nn.Module):
         self,
         values: torch.Tensor,
         ts_attn_mask: Optional[torch.Tensor],
-        prompt: Optional[str] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
         max_new_tokens: int = 200,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -187,38 +187,63 @@ class TSReportLM(nn.Module):
         repetition_penalty: float = 1.05,
         no_repeat_ngram_size: int = 3,
         debug: bool = False,
-    ) -> str:
+    ) -> Union[str, List[str]]:
         self.eval()
         device = next(self.parameters()).device
+
+        # ---- normalize batch ----
+        if values.dim() == 2:
+            values = values.unsqueeze(0)  # [1,T,D]
+        B = values.size(0)
+
         values = values.to(device)
-        ts_attn_mask = ts_attn_mask.to(device) if ts_attn_mask is not None else None
+        if ts_attn_mask is not None:
+            if ts_attn_mask.dim() == 1:
+                ts_attn_mask = ts_attn_mask.unsqueeze(0)
+            ts_attn_mask = ts_attn_mask.to(device)
 
-        # TS -> prefix
-        ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)
-        prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)
-
+        # ---- normalize prompt(s) ----
         if prompt is None or prompt == "":
-            prompt = self.config.default_prompt
+            prompt_list = [self.config.default_prompt] * B
+            return_list = (B > 1)
+        elif isinstance(prompt, list):
+            if len(prompt) != B:
+                raise ValueError(f"len(prompt)={len(prompt)} but batch size B={B}")
+            prompt_list = prompt
+            return_list = True
+        else:
+            prompt_list = [prompt] * B
+            return_list = (B > 1)
 
-        tok = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-        input_ids = tok["input_ids"].to(device)
-        attention_mask = tok["attention_mask"].to(device)
+        # ---- TS -> prefix (already supports batch) ----
+        ts_tokens, ts_mask = self.encode_ts(values, ts_attn_mask)
+        prefix_embeds, prefix_mask = self.bridge(ts_tokens, ts_mask)  # [B,K,H]
 
-        tok_embeds = self.llm.get_input_embeddings()(input_ids)
+        # ---- tokenize prompts as a batch ----
+        tok = self.tokenizer(
+            prompt_list,
+            return_tensors="pt",
+            add_special_tokens=False,
+            padding=True,
+        )
+        input_ids = tok["input_ids"].to(device)              # [B,L]
+        attention_mask = tok["attention_mask"].to(device)    # [B,L]
+
+        tok_embeds = self.llm.get_input_embeddings()(input_ids)  # [B,L,H]
         prefix_embeds = prefix_embeds.to(tok_embeds.dtype)
 
-        inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)
-        attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)
+        inputs_embeds = torch.cat([prefix_embeds, tok_embeds], dim=1)  # [B,K+L,H]
+        attn = torch.cat([prefix_mask.to(attention_mask.dtype), attention_mask], dim=1)  # [B,K+L]
 
         if debug:
-            # quick sanity stats
-            with torch.no_grad():
-                pe = prefix_embeds.float()
-                te = tok_embeds.float()
-                print("prefix dtype", prefix_embeds.dtype)
-                print("prefix nan", torch.isnan(pe).any().item(), "inf", torch.isinf(pe).any().item())
-                print("prefix mean", pe.mean().item(), "std", pe.std().item(), "max", pe.abs().max().item(), "norm", pe.norm().item())
-                print("tok   mean", te.mean().item(), "std", te.std().item(), "max", te.abs().max().item(), "norm", te.norm().item())
+            pe = prefix_embeds.float()
+            te = tok_embeds.float()
+            print("B", B, "prompt_len(max)", input_ids.size(1), "prefix_len", prefix_embeds.size(1))
+            print("prefix dtype", prefix_embeds.dtype)
+            print("prefix nan", torch.isnan(pe).any().item(), "inf", torch.isinf(pe).any().item())
+            print("prefix mean", pe.mean().item(), "std", pe.std().item(), "max", pe.abs().max().item(), "norm", pe.norm().item())
+            print("tok   mean", te.mean().item(), "std", te.std().item(), "max", te.abs().max().item(), "norm", te.norm().item())
+            if hasattr(self.bridge, "prefix_alpha"):
                 print("prefix_alpha", float(self.bridge.prefix_alpha.detach().cpu()))
 
         gen_cfg = GenerationConfig(
@@ -237,14 +262,19 @@ class TSReportLM(nn.Module):
             inputs_embeds=inputs_embeds,
             attention_mask=attn,
             generation_config=gen_cfg,
-        )
+        )  # typically [B, seq_len]
 
-        decoded = self.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        decoded_list = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
-        # best-effort removal of the prompt if it appears verbatim at the beginning
-        if decoded.startswith(prompt):
-            decoded = decoded[len(prompt) :].lstrip()
-        return decoded
+        # ---- strip each prompt prefix ----
+        outs: List[str] = []
+        for dec, pr in zip(decoded_list, prompt_list):
+            text = dec
+            if isinstance(pr, str) and text.startswith(pr):
+                text = text[len(pr):].lstrip()
+            outs.append(text)
+
+        return outs if return_list else outs[0]
 
     # ---------- saving helpers ----------
 

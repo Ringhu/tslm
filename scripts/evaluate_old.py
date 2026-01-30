@@ -14,7 +14,6 @@ import sacrebleu
 from tsrlm.config import TSRLMConfig
 from tsrlm.data import TSSFTDataset
 from tsrlm.models import TSReportLM
-from tsrlm.data.collator import TSSFTCollator
 
 
 def parse_args():
@@ -22,7 +21,6 @@ def parse_args():
     p.add_argument("--eval_jsonl", type=str, required=True)
     p.add_argument("--checkpoint_dir", type=str, required=True)
     p.add_argument("--out_dir", type=str, required=True)
-    p.add_argument("--batch_size", type=int, default=32)
 
     # generation
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -186,6 +184,43 @@ def factual_metrics(gt: Optional[Dict[str, Any]], pred: Optional[Dict[str, Any]]
     return out
 
 
+    def _eq(k: str) -> Optional[float]:
+        if k in gt and k in pred:
+            return float(gt[k] == pred[k])
+        return None
+
+    def _mae(k: str) -> Optional[float]:
+        if k in gt and k in pred:
+            try:
+                return float(abs(float(gt[k]) - float(pred[k])))
+            except Exception:
+                return None
+        return None
+
+    for k in ["trend", "volatility"]:
+        v = _eq(k)
+        if v is not None:
+            out[f"fact_acc/{k}"] = v
+
+    # nested seasonality fields
+    if isinstance(gt.get("seasonality"), dict) and isinstance(pred.get("seasonality"), dict):
+        g = gt["seasonality"]
+        p = pred["seasonality"]
+        if "has" in g and "has" in p:
+            out["fact_acc/seasonality_has"] = float(bool(g["has"]) == bool(p["has"]))
+        if "period" in g and "period" in p:
+            try:
+                out["fact_mae/seasonality_period"] = float(abs(float(g["period"]) - float(p["period"])))
+            except Exception:
+                pass
+
+    v = _mae("delta_pct")
+    if v is not None:
+        out["fact_mae/delta_pct"] = v
+
+    return out
+
+
 def main():
     args = parse_args()
     ckpt_dir = Path(args.checkpoint_dir)
@@ -214,9 +249,6 @@ def main():
     maybe_apply_lora_from_ckpt(model, ckpt_dir)
     load_state(model, ckpt_dir)
     model.eval()
-    torch.set_grad_enabled(False)
-    if device.startswith("cuda"):
-        torch.backends.cuda.matmul.allow_tf32 = True
 
     ds = TSSFTDataset(args.eval_jsonl, max_samples=args.limit)
 
@@ -230,48 +262,18 @@ def main():
 
     pred_path = out_dir / "predictions.jsonl"
     wf = pred_path.open("w", encoding="utf-8")
-    
-    from torch.utils.data import DataLoader
-
-    def collate_fn(batch):
-        # batch: list of items (dict)
-        # values: [T,D] -> pad to [B,Tmax,D]
-        values_list = [b["values"] for b in batch]
-        lens = [v.size(0) for v in values_list]
-        D = values_list[0].size(-1)
-        Tmax = max(lens)
-
-        values = torch.zeros((len(batch), Tmax, D), dtype=values_list[0].dtype)
-        mask = torch.zeros((len(batch), Tmax), dtype=torch.bool)
-
-        for i, v in enumerate(values_list):
-            t = v.size(0)
-            values[i, :t] = v
-            mask[i, :t] = True
-
-        prompts = [(b.get("prompt") or cfg.default_prompt) for b in batch]
-        return {
-            "batch": batch,          # 原始 item 列表，后面写 jsonl 用
-            "values": values,
-            "mask": mask,
-            "prompts": prompts,
-        }
-
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-
 
     print(f"Generating for {len(ds)} samples...")
-    for pack in tqdm(loader, desc="Inference"):
-        values = pack["values"].to(device)          # [B,T,D]
-        mask = pack["mask"].to(device)              # [B,T]
-        prompts = pack["prompts"]                   # List[str]
-        batch_items = pack["batch"]
+    for item in tqdm(ds, desc="Inference"):
+        values = item["values"].unsqueeze(0).to(device)  # [1,T,D]
+        mask = torch.ones((1, values.size(1)), dtype=torch.bool, device=device)
 
+        prompt = item.get("prompt") or cfg.default_prompt
         with torch.no_grad():
-            hyps_batch = model.generate(
+            hyp = model.generate(
                 values=values,
                 ts_attn_mask=mask,
-                prompt=prompts,   # 关键：list
+                prompt=prompt,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
@@ -281,39 +283,40 @@ def main():
                 debug=False,
             )
 
-        # hyps_batch 可能是 List[str]，也可能是一个大字符串（不同实现）
-        if isinstance(hyps_batch, str):
-            # 不支持 batch：退化为逐条（见方案B）
-            raise RuntimeError("model.generate returned str; it may not support batch prompts.")
-        if len(hyps_batch) != len(batch_items):
-            raise RuntimeError(f"Batch size mismatch: got {len(hyps_batch)} hyps for {len(batch_items)} items.")
+        ref = item["output"]
+        hyp_cap = extract_caption(hyp)
+        ref_cap = extract_caption(ref)
 
-        for item, hyp in zip(batch_items, hyps_batch):
-            ref = item["output"]
-            hyp_cap = extract_caption(hyp)
-            ref_cap = extract_caption(ref)
+        hyps.append(hyp_cap)
+        refs.append(ref_cap)
+        rougeL_scores.append(scorer.score(ref_cap, hyp_cap)["rougeL"].fmeasure)
 
-            hyps.append(hyp_cap)
-            refs.append(ref_cap)
-            rougeL_scores.append(scorer.score(ref_cap, hyp_cap)["rougeL"].fmeasure)
+        # factual
+        gt_facts = item.get("facts") or extract_facts(ref)
+        pred_facts = extract_facts(hyp)
+        fm = factual_metrics(gt_facts, pred_facts)
+        for k, v in fm.items():
+            fact_acc.setdefault(k, []).append(v)
 
-            gt_facts = item.get("facts") or extract_facts(ref)
-            pred_facts = extract_facts(hyp)
-            fm = factual_metrics(gt_facts, pred_facts)
-            for k, v in fm.items():
-                fact_acc.setdefault(k, []).append(v)
+        wf.write(
+            json.dumps(
+                {
+                    "id": item["id"],
+                    "prompt": prompt,
+                    "ref": ref,
+                    "hyp": hyp,
+                    "ref_caption": ref_cap,
+                    "hyp_caption": hyp_cap,
+                    "gt_facts": gt_facts,
+                    "pred_facts": pred_facts,
+                    "factual": fm,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
-            wf.write(json.dumps({
-                "id": item["id"],
-                "prompt": item.get("prompt") or cfg.default_prompt,
-                "ref": ref,
-                "hyp": hyp,
-                "ref_caption": ref_cap,
-                "hyp_caption": hyp_cap,
-                "gt_facts": gt_facts,
-                "pred_facts": pred_facts,
-                "factual": fm,
-            }, ensure_ascii=False) + "\n")
+    wf.close()
 
     bleu = sacrebleu.corpus_bleu(hyps, [refs]).score if hyps else 0.0
     rougeL = float(np.mean(rougeL_scores)) if rougeL_scores else 0.0
